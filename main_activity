@@ -1,0 +1,907 @@
+package com.example.optifindapp
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.os.ParcelUuid
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import java.nio.charset.Charset
+import java.util.Locale
+import java.util.UUID
+import kotlin.math.max
+import kotlin.math.min
+
+
+class KalmanFilter(
+    private var processNoise: Double = 0.1,
+    private var measurementNoise: Double = 5.0
+) {
+    private var estimate: Double? = null
+    private var errorCovariance: Double = 1.0
+
+    fun filter(measurement: Double): Double {
+        if (estimate == null) {
+            estimate = measurement
+            return measurement
+        }
+
+        errorCovariance += processNoise
+
+        val gain = errorCovariance / (errorCovariance + measurementNoise)
+        estimate = estimate!! + gain * (measurement - estimate!!)
+        errorCovariance *= (1.0 - gain)
+        return estimate!!
+    }
+
+    fun reset() {
+        estimate = null
+        errorCovariance = 1.0
+    }
+}
+
+
+class MainActivity : ComponentActivity() {
+
+    private val serviceUuid = UUID.fromString("12345678-1234-1234-1234-1234567890ab")
+    private val controlUuid = UUID.fromString("12345678-1234-1234-1234-1234567890ac")
+    private val statusUuid  = UUID.fromString("12345678-1234-1234-1234-1234567890ad")
+    private val cccdUuid    = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private val fallbackName = "Opti-Find"
+
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var scanner: BluetoothLeScanner? = null
+    private var bluetoothGatt: BluetoothGatt? = null
+    private var controlCharacteristic: BluetoothGattCharacteristic? = null
+    private var statusCharacteristic: BluetoothGattCharacteristic? = null
+    private var foundDevice: BluetoothDevice? = null
+
+
+    private val scanningText    = mutableStateOf("No")
+    private val connectedText   = mutableStateOf("No")
+    private val deviceNameText  = mutableStateOf("Not found")
+    private val rawRssiText     = mutableStateOf("--")
+    private val smoothedRssiText = mutableStateOf("--")
+    private val bandText        = mutableStateOf("IDLE")
+    private val trendText       = mutableStateOf("Press Start Scan")
+    private val statusText      = mutableStateOf("--")
+    private val distanceRingText = mutableStateOf("Off")
+    private val logText         = mutableStateOf("App started")
+    private val heatBar         = mutableStateOf(0f)
+
+
+    private val useKalmanState   = mutableStateOf(false)
+    private val filterLabelText  = mutableStateOf("Filter: EMA")
+    private val activeToneText   = mutableStateOf("None")
+    private val manualLedText    = mutableStateOf("Off")
+
+
+    private var filteredRssi: Double? = null
+    private var previousSmoothedRssi: Double? = null
+    private var distanceRingEnabled = false
+    private var lastAutoRangeSent: String? = null
+
+
+    private val kalmanFilter = KalmanFilter()
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        val ok = result.values.all { it }
+        logText.value = if (ok) "Permissions granted" else "Some permissions were denied"
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        bluetoothAdapter = manager.adapter
+        scanner = bluetoothAdapter?.bluetoothLeScanner
+
+        setContent {
+            AppScreen(
+                scanning      = scanningText.value,
+                connected     = connectedText.value,
+                deviceName    = deviceNameText.value,
+                rawRssi       = rawRssiText.value,
+                smoothedRssi  = smoothedRssiText.value,
+                band          = bandText.value,
+                trend         = trendText.value,
+                status        = statusText.value,
+                distanceRing  = distanceRingText.value,
+                heat          = heatBar.value,
+                log           = logText.value,
+                filterLabel   = filterLabelText.value,
+                activeTone    = activeToneText.value,
+                manualLed     = manualLedText.value,
+                onAskPermissions = { askPermissions() },
+                onStartScan   = { startScan() },
+                onStopScan    = { stopScanNow() },
+                onConnect     = { connectToFoundDevice() },
+                onDisconnect  = { disconnectGatt() },
+                onPing        = { sendCommand("PING") },
+                onRing        = {
+                    distanceRingEnabled = false
+                    distanceRingText.value = "Off"
+                    lastAutoRangeSent = null
+                    sendCommand("ALERT=ON")
+                },
+                onDistanceRing = { startDistanceRing() },
+                onSilence     = { silenceAll() },
+
+                onToggleKalman = { toggleKalmanFilter() },
+                onTone1       = { sendCustomTone(1) },
+                onTone2       = { sendCustomTone(2) },
+                onTone3       = { sendCustomTone(3) },
+                onToneOff     = { sendCustomTone(0) },
+
+                onLightOn     = { sendLightOnly(true) },
+                onLightOff    = { sendLightOnly(false) }
+            )
+        }
+    }
+
+    override fun onDestroy() {
+        stopScanNow()
+        disconnectGatt()
+        super.onDestroy()
+    }
+
+    private fun hasPermission(permission: String): Boolean {
+        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requiredPermissions(): Array<String> {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (!hasPermission(Manifest.permission.BLUETOOTH_SCAN))
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            if (!hasPermission(Manifest.permission.BLUETOOTH_CONNECT))
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION))
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        return needed.toTypedArray()
+    }
+
+    private fun askPermissions() {
+        val needed = requiredPermissions()
+        if (needed.isEmpty()) logText.value = "Permissions already granted"
+        else permissionLauncher.launch(needed)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startScan() {
+        val needed = requiredPermissions()
+        if (needed.isNotEmpty()) { logText.value = "Tap Ask Permissions first"; return }
+
+        val s = scanner ?: run { logText.value = "Bluetooth scanner not available"; return }
+
+
+        filteredRssi = null
+        previousSmoothedRssi = null
+        kalmanFilter.reset()
+
+        rawRssiText.value      = "--"
+        smoothedRssiText.value = "--"
+        bandText.value         = "IDLE"
+        trendText.value        = "Looking for Opti-Find..."
+        heatBar.value          = 0f
+        deviceNameText.value   = "Searching..."
+
+        val filters = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(serviceUuid)).build()
+        )
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        s.stopScan(scanCallback)
+        s.startScan(filters, settings, scanCallback)
+
+        scanningText.value = "Yes"
+        logText.value = "Scanning for Opti-Find..."
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanNow() {
+        scanner?.stopScan(scanCallback)
+        scanningText.value = "No"
+        logText.value = "Scan stopped"
+    }
+
+
+    private fun smoothRssiEma(raw: Int): Double {
+        val alpha = 0.25
+        filteredRssi = if (filteredRssi == null) raw.toDouble()
+        else alpha * raw + (1.0 - alpha) * filteredRssi!!
+        return filteredRssi!!
+    }
+
+
+    private fun smoothRssi(raw: Int): Double {
+        return if (useKalmanState.value) kalmanFilter.filter(raw.toDouble())
+        else smoothRssiEma(raw)
+    }
+
+
+    private fun toggleKalmanFilter() {
+        val newVal = !useKalmanState.value
+        useKalmanState.value = newVal
+
+        filteredRssi = null
+        kalmanFilter.reset()
+        filterLabelText.value = if (newVal) "Filter: Kalman" else "Filter: EMA"
+        logText.value = if (newVal) "Switched to Kalman filter" else "Switched to EMA filter"
+    }
+
+    private fun bandFromRssi(rssi: Double): String {
+        return when {
+            rssi < -80 -> "FAR"
+            rssi < -70 -> "MID"
+            rssi < -60 -> "NEAR"
+            else       -> "VERY_CLOSE"
+        }
+    }
+
+    private fun trendFromRssi(current: Double): String {
+        val previous = previousSmoothedRssi ?: return "Move around a little"
+        val delta = current - previous
+        return when {
+            delta > 1.5  -> "Getting closer"
+            delta < -1.5 -> "Getting farther"
+            else         -> "About the same"
+        }
+    }
+
+    private fun heatFromRssi(rssi: Double): Float {
+        val minRssi = -95.0
+        val maxRssi = -45.0
+        val clamped = max(minRssi, min(maxRssi, rssi))
+        return ((clamped - minRssi) / (maxRssi - minRssi)).toFloat()
+    }
+
+    private fun currentBandCommand(): String? {
+        return when (bandText.value) {
+            "FAR"        -> "RANGE=FAR"
+            "MID"        -> "RANGE=MID"
+            "NEAR"       -> "RANGE=NEAR"
+            "VERY_CLOSE" -> "RANGE=VERY_CLOSE"
+            else         -> null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeControl(cmd: String, showInLog: Boolean = true): Boolean {
+        val needed = requiredPermissions()
+        if (needed.isNotEmpty()) {
+            if (showInLog) logText.value = "Tap Ask Permissions first"
+            return false
+        }
+        val gatt = bluetoothGatt
+        val characteristic = controlCharacteristic
+        if (gatt == null || characteristic == null) {
+            if (showInLog) logText.value = "Connect first"
+            return false
+        }
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        characteristic.value = cmd.toByteArray(Charset.forName("UTF-8"))
+        val ok = gatt.writeCharacteristic(characteristic)
+        if (showInLog) logText.value = if (ok) "Sent: $cmd" else "Failed to send: $cmd"
+        return ok
+    }
+
+    private fun maybeSendDistanceRange() {
+        if (!distanceRingEnabled) return
+        if (connectedText.value != "Yes") return
+        val cmd = currentBandCommand() ?: return
+        if (cmd == lastAutoRangeSent) return
+        val ok = writeControl(cmd, showInLog = false)
+        if (ok) {
+            lastAutoRangeSent = cmd
+            logText.value = "Distance ring: ${cmd.removePrefix("RANGE=")}"
+        }
+    }
+
+    private fun startDistanceRing() {
+        if (connectedText.value != "Yes") { logText.value = "Connect first"; return }
+        val cmd = currentBandCommand() ?: run {
+            logText.value = "Start Scan first so the app knows near/far"
+            return
+        }
+        distanceRingEnabled = true
+        distanceRingText.value = "On"
+        lastAutoRangeSent = null
+        maybeSendDistanceRange()
+    }
+
+    private fun silenceAll() {
+        distanceRingEnabled = false
+        distanceRingText.value = "Off"
+        lastAutoRangeSent = null
+        activeToneText.value = "None"
+        manualLedText.value  = "Off"
+        if (connectedText.value == "Yes") {
+            writeControl("RANGE=IDLE", showInLog = false)
+            writeControl("ALERT=OFF", showInLog = true)
+        } else {
+            logText.value = "Distance ring off"
+        }
+    }
+
+
+    private fun sendCustomTone(slot: Int) {
+        if (connectedText.value != "Yes") { logText.value = "Connect first"; return }
+        val cmd = if (slot == 0) "TONE=OFF" else "TONE=$slot"
+        val ok = writeControl(cmd, showInLog = true)
+        if (ok) {
+            activeToneText.value = if (slot == 0) "None" else "Tone $slot"
+        }
+    }
+
+
+    private fun sendLightOnly(on: Boolean) {
+        if (connectedText.value != "Yes") { logText.value = "Connect first"; return }
+        val cmd = if (on) "LED=ON" else "LED=OFF"
+        val ok = writeControl(cmd, showInLog = true)
+        if (ok) manualLedText.value = if (on) "On" else "Off"
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val device = result.device
+            val advertisedName = result.scanRecord?.deviceName ?: device.name ?: fallbackName
+            val raw     = result.rssi
+            val smoothed = smoothRssi(raw)
+            val trend   = trendFromRssi(smoothed)
+            val band    = bandFromRssi(smoothed)
+            val heat    = heatFromRssi(smoothed)
+
+            foundDevice            = device
+            deviceNameText.value   = advertisedName
+            rawRssiText.value      = raw.toString()
+            smoothedRssiText.value = String.format(Locale.US, "%.1f", smoothed)
+            bandText.value         = band
+            trendText.value        = trend
+            heatBar.value          = heat
+
+            previousSmoothedRssi = smoothed
+            maybeSendDistanceRange()
+
+            logText.value = if (distanceRingEnabled)
+                "Live RSSI updated • auto ring active"
+            else
+                "Live RSSI updated"
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanningText.value = "No"
+            logText.value = "Scan failed: $errorCode"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectToFoundDevice() {
+        val needed = requiredPermissions()
+        if (needed.isNotEmpty()) { logText.value = "Tap Ask Permissions first"; return }
+        val device = foundDevice ?: run { logText.value = "No device found yet. Start Scan first."; return }
+        logText.value = "Connecting..."
+        bluetoothGatt?.close()
+        bluetoothGatt = device.connectGatt(this, false, gattCallback)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun disconnectGatt() {
+        bluetoothGatt?.disconnect()
+        bluetoothGatt?.close()
+        bluetoothGatt            = null
+        controlCharacteristic    = null
+        statusCharacteristic     = null
+        connectedText.value      = "No"
+        statusText.value         = "--"
+        distanceRingEnabled      = false
+        distanceRingText.value   = "Off"
+        lastAutoRangeSent        = null
+        activeToneText.value     = "None"
+        manualLedText.value      = "Off"
+        logText.value            = "Disconnected"
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            runOnUiThread {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    connectedText.value = "Yes"
+                    logText.value = "Connected. Discovering services..."
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    connectedText.value   = "No"
+                    controlCharacteristic = null
+                    statusCharacteristic  = null
+                    statusText.value      = "--"
+                    distanceRingEnabled   = false
+                    distanceRingText.value = "Off"
+                    lastAutoRangeSent     = null
+                    activeToneText.value  = "None"
+                    manualLedText.value   = "Off"
+                    logText.value         = "GATT disconnected"
+                }
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            runOnUiThread {
+                val service = gatt.getService(serviceUuid) ?: run {
+                    logText.value = "Service not found"; return@runOnUiThread
+                }
+                controlCharacteristic = service.getCharacteristic(controlUuid)
+                statusCharacteristic  = service.getCharacteristic(statusUuid)
+                if (statusCharacteristic != null)
+                    enableStatusNotifications(gatt, statusCharacteristic!!)
+                logText.value = if (controlCharacteristic != null)
+                    "Ready to send commands"
+                else
+                    "Control characteristic not found"
+            }
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (characteristic.uuid == statusUuid) {
+                val value = characteristic.value?.toString(Charset.forName("UTF-8")) ?: ""
+                runOnUiThread { statusText.value = value }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enableStatusNotifications(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+        gatt.setCharacteristicNotification(characteristic, true)
+        val descriptor = characteristic.getDescriptor(cccdUuid)
+        if (descriptor != null) {
+            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            gatt.writeDescriptor(descriptor)
+        }
+    }
+
+    private fun sendCommand(cmd: String) {
+        writeControl(cmd, showInLog = true)
+    }
+}
+
+
+private val BgDeep      = Color(0xFF0A0C10)
+private val BgCard      = Color(0xFF141720)
+private val BgCardAlt   = Color(0xFF1C2030)
+private val AccentCyan  = Color(0xFF00E5FF)
+private val AccentAmber = Color(0xFFFFB300)
+private val AccentRed   = Color(0xFFFF4444)
+private val AccentGreen = Color(0xFF00E676)
+private val TextPrimary = Color(0xFFEAEDF4)
+private val TextMuted   = Color(0xFF6B7280)
+private val BorderColor = Color(0xFF252A38)
+
+
+@Composable
+fun AppScreen(
+    scanning: String,
+    connected: String,
+    deviceName: String,
+    rawRssi: String,
+    smoothedRssi: String,
+    band: String,
+    trend: String,
+    status: String,
+    distanceRing: String,
+    heat: Float,
+    log: String,
+    filterLabel: String,
+    activeTone: String,
+    manualLed: String,
+    onAskPermissions: () -> Unit,
+    onStartScan: () -> Unit,
+    onStopScan: () -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onPing: () -> Unit,
+    onRing: () -> Unit,
+    onDistanceRing: () -> Unit,
+    onSilence: () -> Unit,
+    onToggleKalman: () -> Unit,
+    onTone1: () -> Unit,
+    onTone2: () -> Unit,
+    onTone3: () -> Unit,
+    onToneOff: () -> Unit,
+    onLightOn: () -> Unit,
+    onLightOff: () -> Unit
+) {
+    MaterialTheme {
+        Surface(color = BgDeep) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text(
+                            "OPTI·FIND",
+                            color = AccentCyan,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 4.sp
+                        )
+                        Text(
+                            "BLE TRACKER",
+                            color = TextMuted,
+                            fontSize = 10.sp,
+                            letterSpacing = 3.sp
+                        )
+                    }
+
+                    val connColor = if (connected == "Yes") AccentGreen else AccentRed
+                    val connLabel = if (connected == "Yes") "● CONNECTED" else "○ OFFLINE"
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(connColor.copy(alpha = 0.15f))
+                            .border(1.dp, connColor.copy(alpha = 0.4f), RoundedCornerShape(20.dp))
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(connLabel, color = connColor, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+
+
+                InfoCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            CardLabel("DEVICE")
+                            Text(deviceName, color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            CardLabel("SCANNING")
+                            val scanColor = if (scanning == "Yes") AccentCyan else TextMuted
+                            Text(
+                                if (scanning == "Yes") "● ACTIVE" else "○ IDLE",
+                                color = scanColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+
+
+                InfoCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            CardLabel("RAW RSSI")
+                            Text(
+                                "$rawRssi dBm",
+                                color = AccentCyan,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            CardLabel(filterLabel.uppercase())
+                            Text(
+                                "$smoothedRssi dBm",
+                                color = AccentAmber,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                            CardLabel("BAND")
+                            val bandColor = when (band) {
+                                "VERY_CLOSE" -> AccentGreen
+                                "NEAR"       -> AccentCyan
+                                "MID"        -> AccentAmber
+                                "FAR"        -> AccentRed
+                                else         -> TextMuted
+                            }
+                            Text(band, color = bandColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.padding(top = 10.dp))
+
+
+                    CardLabel("TREND")
+                    Text(trend, color = TextPrimary, fontSize = 13.sp)
+
+                    Spacer(modifier = Modifier.padding(top = 10.dp))
+
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("FAR", color = TextMuted, fontSize = 10.sp)
+                        Text("CLOSE", color = TextMuted, fontSize = 10.sp)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 2.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .defaultMinSize(minHeight = 10.dp)
+                            .background(BgCardAlt)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(heat.coerceIn(0f, 1f))
+                                .defaultMinSize(minHeight = 10.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(
+                                    Brush.horizontalGradient(
+                                        listOf(
+                                            Color(0xFF1565C0),
+                                            Color(0xFF00BCD4),
+                                            Color(0xFF66BB6A),
+                                            Color(0xFFFFB300),
+                                            Color(0xFFFF4444)
+                                        )
+                                    )
+                                )
+                        )
+                    }
+                }
+
+
+                InfoCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            CardLabel("DIST RING")
+                            val drColor = if (distanceRing == "On") AccentGreen else TextMuted
+                            Text(distanceRing.uppercase(), color = drColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            CardLabel("ACTIVE TONE")
+                            Text(activeTone, color = if (activeTone == "None") TextMuted else AccentAmber,
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                            CardLabel("LED")
+                            val ledColor = if (manualLed == "On") AccentAmber else TextMuted
+                            Text(manualLed.uppercase(), color = ledColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                    Spacer(modifier = Modifier.padding(top = 8.dp))
+                    CardLabel("ESP32 STATUS")
+                    Text(status, color = TextPrimary, fontSize = 12.sp)
+                    Spacer(modifier = Modifier.padding(top = 6.dp))
+                    CardLabel("LOG")
+                    Text(log, color = TextMuted, fontSize = 11.sp)
+                }
+
+
+                SectionLabel("SETUP")
+                TwoButtonRow("Permissions", "Start Scan",  onAskPermissions, onStartScan,  secondary = true, primary = true)
+                TwoButtonRow("Stop Scan",   "Connect",     onStopScan,       onConnect,    secondary = true, primary = true)
+                TwoButtonRow("Disconnect",  "Ping",        onDisconnect,     onPing,       secondary = true, secondary2 = true)
+
+
+                SectionLabel("ALERTS")
+                TwoButtonRow("Ring",     "Dist Ring", onRing,     onDistanceRing, primary = true,  primary2 = true)
+                TwoButtonRow("Light On", "Light Off", onLightOn,  onLightOff,     amber = true,    secondary = true)
+
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    DangerButton("⬛  SILENCE ALL", onSilence, modifier = Modifier.fillMaxWidth())
+                }
+
+
+                SectionLabel("SIGNAL FILTER")
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    StyledButton(
+                        label = "Toggle  •  $filterLabel",
+                        onClick = onToggleKalman,
+                        modifier = Modifier.fillMaxWidth(),
+                        secondary = true
+                    )
+                }
+
+
+                SectionLabel("CUSTOM TONES")
+                TwoButtonRow("Tone 1", "Tone 2", onTone1, onTone2, secondary = true, secondary2 = true)
+                TwoButtonRow("Tone 3", "Tone Off", onTone3, onToneOff, secondary = true, secondary2 = true)
+            }
+        }
+    }
+}
+
+
+@Composable
+fun InfoCard(content: @Composable () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(BgCard)
+            .border(1.dp, BorderColor, RoundedCornerShape(14.dp))
+            .padding(16.dp)
+    ) {
+        Column { content() }
+    }
+}
+
+@Composable
+fun CardLabel(text: String) {
+    Text(
+        text,
+        color = TextMuted,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 2.sp,
+        modifier = Modifier.padding(bottom = 2.dp)
+    )
+}
+
+@Composable
+fun SectionLabel(text: String) {
+    Text(
+        text,
+        color = TextMuted,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 2.sp,
+        modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)
+    )
+}
+
+@Composable
+fun StyledButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    primary: Boolean = false,
+    secondary: Boolean = false,
+    amber: Boolean = false,
+    danger: Boolean = false
+) {
+    val bgColor = when {
+        primary   -> AccentCyan.copy(alpha = 0.15f)
+        amber     -> AccentAmber.copy(alpha = 0.15f)
+        danger    -> AccentRed.copy(alpha = 0.15f)
+        else      -> BgCardAlt
+    }
+    val borderCol = when {
+        primary   -> AccentCyan.copy(alpha = 0.5f)
+        amber     -> AccentAmber.copy(alpha = 0.5f)
+        danger    -> AccentRed.copy(alpha = 0.5f)
+        else      -> BorderColor
+    }
+    val textCol = when {
+        primary   -> AccentCyan
+        amber     -> AccentAmber
+        danger    -> AccentRed
+        else      -> TextPrimary
+    }
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        colors = ButtonDefaults.outlinedButtonColors(containerColor = bgColor),
+        border = androidx.compose.foundation.BorderStroke(1.dp, borderCol)
+    ) {
+        Text(label, color = textCol, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+    }
+}
+
+@Composable
+fun DangerButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    StyledButton(label = label, onClick = onClick, modifier = modifier, danger = true)
+}
+
+@Composable
+fun TwoButtonRow(
+    leftLabel: String,
+    rightLabel: String,
+    onLeft: () -> Unit,
+    onRight: () -> Unit,
+    primary: Boolean  = false,
+    primary2: Boolean = false,
+    secondary: Boolean  = false,
+    secondary2: Boolean = false,
+    amber: Boolean    = false,
+    amber2: Boolean   = false
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        StyledButton(
+            label = leftLabel,
+            onClick = onLeft,
+            modifier = Modifier.weight(1f),
+            primary = primary,
+            secondary = secondary,
+            amber = amber
+        )
+        StyledButton(
+            label = rightLabel,
+            onClick = onRight,
+            modifier = Modifier.weight(1f),
+            primary = primary2,
+            secondary = secondary2,
+            amber = amber2
+        )
+    }
+}
